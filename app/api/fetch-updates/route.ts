@@ -14,117 +14,131 @@ interface FeedItem {
   url: string | null
 }
 
-async function searchCategory(monthName: string, year: string, category: Category): Promise<FeedItem[]> {
-  const apiKey = process.env.GEMINI_API_KEY!
+const MODELS = ['gemini-2.0-flash', 'gemini-1.5-flash']
+
+async function callGemini(apiKey: string, prompt: string): Promise<string> {
+  let lastError = ''
+  for (const model of MODELS) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tools: [{ google_search: {} }],
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: { temperature: 0.1, maxOutputTokens: 2048 },
+          }),
+        }
+      )
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        lastError = `${model}: ${err?.error?.message || res.statusText}`
+        continue
+      }
+
+      const data = await res.json()
+      const text: string = (data.candidates?.[0]?.content?.parts || [])
+        .map((p: { text?: string }) => p.text || '')
+        .join('')
+
+      if (text) return text
+      lastError = `${model}: empty response`
+    } catch (e) {
+      lastError = `${model}: ${e instanceof Error ? e.message : 'unknown error'}`
+    }
+  }
+  throw new Error(`All models failed. Last error: ${lastError}`)
+}
+
+function extractJson(text: string): FeedItem[] {
+  // Strip markdown code fences if present
+  const cleaned = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+
+  // Try to find a JSON array
+  const match = cleaned.match(/\[[\s\S]*\]/)
+  if (!match) return []
+
+  try {
+    const parsed = JSON.parse(match[0])
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    // Try to fix truncated JSON by closing the array
+    try {
+      const partial = match[0].replace(/,\s*$/, '') + ']'
+      const parsed = JSON.parse(partial)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+}
+
+async function searchCategory(apiKey: string, monthName: string, year: string, category: Category): Promise<FeedItem[]> {
   const monthYear = `${monthName} ${year}`
 
   const prompts: Record<Category, string> = {
-    critical: `Search for Microsoft Azure and Microsoft 365 ACTION REQUIRED and critical mandatory updates for ${monthYear}.
-Find specific items like:
-- TLS/SSL version retirements (e.g. TLS 1.0/1.1 end of support deadlines)
-- Authentication changes admins MUST implement (Basic Auth deprecation, legacy auth blocks, Modern Auth enforcement)
-- MFA enforcement deadlines from Microsoft
-- Mandatory security patches or configuration changes
-- Breaking API/SDK changes with hard deadlines
-- License or subscription changes requiring action
-Return 4-6 real specific items found via web search from official Microsoft sources.`,
+    critical: `Search the web for Microsoft Azure and Microsoft 365 MANDATORY ACTION REQUIRED items for ${monthYear}.
+Look for: TLS/SSL retirement deadlines, Basic Auth deprecation, MFA enforcement, mandatory security patches, breaking API changes, required license upgrades.
+Return ONLY a JSON array (no markdown, no explanation) with 4-6 items in this exact format:
+[{"category":"critical","title":"short title","summary":"2-3 sentences for IT admins with specific details","date":"${monthYear}","deadline":"date or null","source":"source name","url":"url or null"}]`,
 
-    deprecation: `Search for Microsoft Azure and Microsoft 365 SERVICE RETIREMENTS and DEPRECATIONS for ${monthYear}.
-Find specific items like:
-- Azure services being retired or reaching end-of-life with exact dates
-- M365 features being removed or deprecated
-- APIs, SDKs, or endpoints being shut down
-- Classic portals or legacy experiences being retired
-- VM sizes, regions, or SKUs being discontinued
-Include exact retirement dates wherever available.
-Return 4-6 real specific items from official Microsoft sources like azure.microsoft.com/updates.`,
+    deprecation: `Search the web for Microsoft Azure and Microsoft 365 SERVICE RETIREMENTS and DEPRECATIONS for ${monthYear}.
+Look for: Azure services being retired, M365 features removed, APIs shut down, classic portals retired, VM sizes discontinued. Include exact retirement dates.
+Return ONLY a JSON array (no markdown, no explanation) with 4-6 items in this exact format:
+[{"category":"deprecation","title":"short title","summary":"2-3 sentences with specific service names and dates","date":"${monthYear}","deadline":"retirement date or null","source":"source name","url":"url or null"}]`,
 
-    feature: `Search for NEW features and capabilities announced or made Generally Available in Microsoft Azure and Microsoft 365 during ${monthYear}.
-Find specific items like:
-- New Azure services launched or reaching GA
-- New M365 features rolling out (Teams, SharePoint, Exchange, Entra ID, Intune, Copilot)
-- Public Preview announcements
-- New AI/Copilot capabilities
-- New integrations or connectors
-Return 4-6 real specific items from official Microsoft blogs.`,
+    feature: `Search the web for NEW Microsoft Azure and Microsoft 365 features that became Generally Available or entered Public Preview in ${monthYear}.
+Look for: new Azure services, new M365/Teams/SharePoint/Entra/Intune features, new Copilot capabilities, new integrations.
+Return ONLY a JSON array (no markdown, no explanation) with 4-6 items in this exact format:
+[{"category":"feature","title":"short title","summary":"2-3 sentences describing the feature and its benefit","date":"${monthYear}","deadline":null,"source":"source name","url":"url or null"}]`,
 
-    news: `Search for important Microsoft Azure and Microsoft 365 NEWS and ANNOUNCEMENTS from ${monthYear}.
-Find specific items like:
-- Major pricing changes
-- New region or availability zone launches
-- Important security advisories or CVEs
-- Compliance and certification updates
-- Major policy or governance changes
-- Product rebranding or restructuring
-Return 4-6 real specific items from official Microsoft sources.`,
+    news: `Search the web for important Microsoft Azure and Microsoft 365 NEWS from ${monthYear}.
+Look for: pricing changes, new regions, security advisories, CVEs, compliance updates, major policy changes, product announcements.
+Return ONLY a JSON array (no markdown, no explanation) with 4-6 items in this exact format:
+[{"category":"news","title":"short title","summary":"2-3 sentences summarizing the news and its impact","date":"${monthYear}","deadline":null,"source":"source name","url":"url or null"}]`,
   }
 
-  const systemInstruction = `You are a Microsoft cloud expert analyst. Search the web and return ONLY a raw JSON array — no markdown, no backticks, no explanation text before or after.
-
-Each item must have this exact shape:
-{
-  "category": "${category}",
-  "title": "concise title under 12 words",
-  "summary": "2-3 sentences for IT admins. Be specific — include service names, version numbers, deadlines.",
-  "date": "e.g. Apr 2025",
-  "deadline": "specific deadline date if applicable, or null",
-  "source": "e.g. Azure Updates, Microsoft Tech Community, Microsoft 365 Admin Center",
-  "url": "direct URL to official Microsoft documentation or null"
-}
-
-Only return real items you found via search. Never fabricate. Start your response with [ and end with ].`
-
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          tools: [{ google_search: {} }],
-          contents: [{ parts: [{ text: prompts[category] }], role: 'user' }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 2000 },
-        }),
-      }
-    )
-
-    if (!response.ok) return []
-
-    const data = await response.json()
-    const text: string = (data.candidates?.[0]?.content?.parts || [])
-      .filter((p: { text?: string }) => p.text)
-      .map((p: { text: string }) => p.text)
-      .join('')
-
-    const match = text.match(/\[[\s\S]*\]/)
-    if (!match) return []
-
-    const items = JSON.parse(match[0])
-    return Array.isArray(items) ? items.map((i: FeedItem) => ({ ...i, category })) : []
-  } catch {
+    const text = await callGemini(apiKey, prompts[category])
+    const items = extractJson(text)
+    return items.map(i => ({ ...i, category }))
+  } catch (e) {
+    console.error(`Category ${category} failed:`, e)
     return []
   }
 }
 
 export async function POST(req: Request) {
   const apiKey = process.env.GEMINI_API_KEY
-  if (!apiKey) return NextResponse.json({ error: 'GEMINI_API_KEY is not set in environment variables' }, { status: 500 })
+  if (!apiKey) {
+    return NextResponse.json(
+      { error: 'GEMINI_API_KEY is not set. Add it in Vercel → Settings → Environment Variables, then redeploy.' },
+      { status: 500 }
+    )
+  }
 
   let body: { month?: string; year?: string } = {}
-  try { body = await req.json() } catch { return NextResponse.json({ error: 'Invalid request' }, { status: 400 }) }
+  try { body = await req.json() } catch {
+    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
+  }
 
   const { year, month } = body
-  if (!year || !month) return NextResponse.json({ error: 'Month and year are required' }, { status: 400 })
+  if (!year || !month) {
+    return NextResponse.json({ error: 'Month and year are required' }, { status: 400 })
+  }
 
-  const monthName = new Date(`${year}-${month.padStart(2, '0')}-01`).toLocaleString('en-US', { month: 'long' })
+  const monthName = new Date(`${year}-${month.padStart(2, '0')}-01`)
+    .toLocaleString('en-US', { month: 'long' })
 
   try {
     const [critical, deprecation, feature, news] = await Promise.all([
-      searchCategory(monthName, year, 'critical'),
-      searchCategory(monthName, year, 'deprecation'),
-      searchCategory(monthName, year, 'feature'),
-      searchCategory(monthName, year, 'news'),
+      searchCategory(apiKey, monthName, year, 'critical'),
+      searchCategory(apiKey, monthName, year, 'deprecation'),
+      searchCategory(apiKey, monthName, year, 'feature'),
+      searchCategory(apiKey, monthName, year, 'news'),
     ])
 
     const items = [...critical, ...deprecation, ...feature, ...news]
@@ -132,8 +146,18 @@ export async function POST(req: Request) {
       arr.findIndex(o => o.title === item.title) === idx
     )
 
+    if (deduped.length === 0) {
+      return NextResponse.json({
+        error: `No updates found for ${monthName} ${year}. The Gemini API may have returned unexpected data. Check that GEMINI_API_KEY is valid in Vercel.`,
+        items: []
+      })
+    }
+
     return NextResponse.json({ items: deduped })
   } catch (e: unknown) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : 'Failed to fetch updates' }, { status: 500 })
+    return NextResponse.json(
+      { error: e instanceof Error ? e.message : 'Failed to fetch updates' },
+      { status: 500 }
+    )
   }
 }
