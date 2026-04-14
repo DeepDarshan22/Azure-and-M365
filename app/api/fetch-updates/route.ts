@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server'
-import { XMLParser } from 'fast-xml-parser'
 
-export const maxDuration = 30
+export const maxDuration = 60
 
 type Category = 'critical' | 'deprecation' | 'feature' | 'news'
 
@@ -13,103 +12,128 @@ interface FeedItem {
   deadline: string | null
   source: string
   url: string | null
-  _pubDate?: string
 }
 
-const RSS_FEEDS = [
-  { url: 'https://azure.microsoft.com/en-us/updates/feed/', source: 'Azure Updates' },
-  { url: 'https://azure.microsoft.com/en-us/blog/feed/', source: 'Azure Blog' },
-  { url: 'https://www.microsoft.com/en-us/microsoft-365/blog/feed/', source: 'Microsoft 365 Blog' },
-  { url: 'https://msrc.microsoft.com/blog/feed', source: 'Microsoft Security' },
-]
+async function searchCategory(monthName: string, year: string, category: Category): Promise<FeedItem[]> {
+  const apiKey = process.env.GEMINI_API_KEY!
+  const monthYear = `${monthName} ${year}`
 
-function extractStr(val: unknown): string {
-  if (!val) return ''
-  if (typeof val === 'string') return val.trim()
-  if (typeof val === 'object' && val !== null) {
-    const obj = val as Record<string, unknown>
-    if ('__cdata' in obj) return String(obj.__cdata).trim()
-    if ('#text' in obj) return String(obj['#text']).trim()
+  const prompts: Record<Category, string> = {
+    critical: `Search for Microsoft Azure and Microsoft 365 ACTION REQUIRED and critical mandatory updates for ${monthYear}.
+Find specific items like:
+- TLS/SSL version retirements (e.g. TLS 1.0/1.1 end of support deadlines)
+- Authentication changes admins MUST implement (Basic Auth deprecation, legacy auth blocks, Modern Auth enforcement)
+- MFA enforcement deadlines from Microsoft
+- Mandatory security patches or configuration changes
+- Breaking API/SDK changes with hard deadlines
+- License or subscription changes requiring action
+Return 4-6 real specific items found via web search from official Microsoft sources.`,
+
+    deprecation: `Search for Microsoft Azure and Microsoft 365 SERVICE RETIREMENTS and DEPRECATIONS for ${monthYear}.
+Find specific items like:
+- Azure services being retired or reaching end-of-life with exact dates
+- M365 features being removed or deprecated
+- APIs, SDKs, or endpoints being shut down
+- Classic portals or legacy experiences being retired
+- VM sizes, regions, or SKUs being discontinued
+Include exact retirement dates wherever available.
+Return 4-6 real specific items from official Microsoft sources like azure.microsoft.com/updates.`,
+
+    feature: `Search for NEW features and capabilities announced or made Generally Available in Microsoft Azure and Microsoft 365 during ${monthYear}.
+Find specific items like:
+- New Azure services launched or reaching GA
+- New M365 features rolling out (Teams, SharePoint, Exchange, Entra ID, Intune, Copilot)
+- Public Preview announcements
+- New AI/Copilot capabilities
+- New integrations or connectors
+Return 4-6 real specific items from official Microsoft blogs.`,
+
+    news: `Search for important Microsoft Azure and Microsoft 365 NEWS and ANNOUNCEMENTS from ${monthYear}.
+Find specific items like:
+- Major pricing changes
+- New region or availability zone launches
+- Important security advisories or CVEs
+- Compliance and certification updates
+- Major policy or governance changes
+- Product rebranding or restructuring
+Return 4-6 real specific items from official Microsoft sources.`,
   }
-  return String(val).trim()
+
+  const systemInstruction = `You are a Microsoft cloud expert analyst. Search the web and return ONLY a raw JSON array — no markdown, no backticks, no explanation text before or after.
+
+Each item must have this exact shape:
+{
+  "category": "${category}",
+  "title": "concise title under 12 words",
+  "summary": "2-3 sentences for IT admins. Be specific — include service names, version numbers, deadlines.",
+  "date": "e.g. Apr 2025",
+  "deadline": "specific deadline date if applicable, or null",
+  "source": "e.g. Azure Updates, Microsoft Tech Community, Microsoft 365 Admin Center",
+  "url": "direct URL to official Microsoft documentation or null"
 }
 
-function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
-    .replace(/\s+/g, ' ').trim()
-}
+Only return real items you found via search. Never fabricate. Start your response with [ and end with ].`
 
-function categorize(title: string, desc: string): Category {
-  const text = `${title} ${desc}`.toLowerCase()
-  if (/deprecat|retir|end.of.life|\beol\b|end.of.support|sunset|discontinu|will.be.removed|shutting.down|no.longer.support/.test(text)) return 'deprecation'
-  if (/\bsecurity\b|vulnerab|\bcve-|\bpatch\b|critical|action.required|action.needed|breaking.change|\btls\b|\bssl\b|must.upgrade|mandatory|urgent|compliance.required|update.required|service.disruption/.test(text)) return 'critical'
-  if (/generally.available|public.preview|\bga\b|new.feature|announc|introduc|now.available|\bpreview\b|launched|releasing|rolling.out|new.capability/.test(text)) return 'feature'
-  return 'news'
-}
-
-function matchesMonth(pubDate: string, year: number, month: number): boolean {
-  if (!pubDate) return false
   try {
-    const d = new Date(pubDate)
-    if (isNaN(d.getTime())) return false
-    return d.getFullYear() === year && d.getMonth() + 1 === month
-  } catch { return false }
-}
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+          tools: [{ google_search: {} }],
+          contents: [{ parts: [{ text: prompts[category] }], role: 'user' }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 2000 },
+        }),
+      }
+    )
 
-function formatDate(pubDate: string): string {
-  try {
-    return new Date(pubDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-  } catch { return pubDate }
-}
+    if (!response.ok) return []
 
-async function fetchFeed(feedUrl: string, source: string): Promise<FeedItem[]> {
-  try {
-    const res = await fetch(feedUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AzureM365Intel/1.0)' },
-      next: { revalidate: 0 },
-    })
-    if (!res.ok) return []
-    const xml = await res.text()
-    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', cdataPropName: '__cdata', textNodeName: '#text' })
-    const parsed = parser.parse(xml)
-    const channel = parsed?.rss?.channel || parsed?.feed
-    if (!channel) return []
-    const rawItems = channel.item || channel.entry || []
-    const items = Array.isArray(rawItems) ? rawItems : rawItems ? [rawItems] : []
+    const data = await response.json()
+    const text: string = (data.candidates?.[0]?.content?.parts || [])
+      .filter((p: { text?: string }) => p.text)
+      .map((p: { text: string }) => p.text)
+      .join('')
 
-    return items.map((item: Record<string, unknown>) => {
-      const title = extractStr(item.title)
-      const description = stripHtml(extractStr(item.description || item.summary || item.content || ''))
-      const pubDate = extractStr(item.pubDate || item.updated || item.published || '')
-      const link = extractStr(item.link || item.id || '')
-      const summary = description.length > 300 ? description.slice(0, 300) + '…' : description || title
-      return { category: categorize(title, description), title, summary, date: formatDate(pubDate), deadline: null, source, url: link || null, _pubDate: pubDate }
-    })
-  } catch { return [] }
+    const match = text.match(/\[[\s\S]*\]/)
+    if (!match) return []
+
+    const items = JSON.parse(match[0])
+    return Array.isArray(items) ? items.map((i: FeedItem) => ({ ...i, category })) : []
+  } catch {
+    return []
+  }
 }
 
 export async function POST(req: Request) {
-  let body: { month?: string; year?: string } = {}
-  try { body = await req.json() } catch { return NextResponse.json({ error: 'Invalid request body' }, { status: 400 }) }
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) return NextResponse.json({ error: 'GEMINI_API_KEY is not set in environment variables' }, { status: 500 })
 
-  const year = parseInt(body.year || '')
-  const month = parseInt(body.month || '')
-  if (!year || !month || month < 1 || month > 12) return NextResponse.json({ error: 'Valid month and year required' }, { status: 400 })
+  let body: { month?: string; year?: string } = {}
+  try { body = await req.json() } catch { return NextResponse.json({ error: 'Invalid request' }, { status: 400 }) }
+
+  const { year, month } = body
+  if (!year || !month) return NextResponse.json({ error: 'Month and year are required' }, { status: 400 })
+
+  const monthName = new Date(`${year}-${month.padStart(2, '0')}-01`).toLocaleString('en-US', { month: 'long' })
 
   try {
-    const results = await Promise.allSettled(RSS_FEEDS.map(f => fetchFeed(f.url, f.source)))
-    const allItems: FeedItem[] = results.flatMap(r => r.status === 'fulfilled' ? r.value : [])
-    const filtered = allItems
-      .filter(item => matchesMonth(item._pubDate || '', year, month))
-      .map(({ _pubDate: _, ...rest }) => rest)
-    const deduped = filtered.filter((item, idx, arr) => arr.findIndex(o => o.title === item.title) === idx)
-    const order: Record<Category, number> = { critical: 0, deprecation: 1, feature: 2, news: 3 }
-    const sorted = deduped.sort((a, b) => order[a.category] - order[b.category])
-    return NextResponse.json({ items: sorted })
+    const [critical, deprecation, feature, news] = await Promise.all([
+      searchCategory(monthName, year, 'critical'),
+      searchCategory(monthName, year, 'deprecation'),
+      searchCategory(monthName, year, 'feature'),
+      searchCategory(monthName, year, 'news'),
+    ])
+
+    const items = [...critical, ...deprecation, ...feature, ...news]
+    const deduped = items.filter((item, idx, arr) =>
+      arr.findIndex(o => o.title === item.title) === idx
+    )
+
+    return NextResponse.json({ items: deduped })
   } catch (e: unknown) {
-    return NextResponse.json({ error: e instanceof Error ? e.message : 'Failed to fetch feeds' }, { status: 500 })
+    return NextResponse.json({ error: e instanceof Error ? e.message : 'Failed to fetch updates' }, { status: 500 })
   }
 }
